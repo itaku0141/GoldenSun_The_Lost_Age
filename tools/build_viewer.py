@@ -49,7 +49,44 @@ def build_area(area):
     return numbering, unmatched, ends
 
 
-def diagram(numbering, unmatched):
+def find_route(area, numbering, unmatched):
+    """スタート地点→次のチャート の最短経路。戻り値: (区間のマップ列のリスト, 経路上の有向辺の集合)"""
+    adj = collections.defaultdict(set)
+    for lo, hi, _ in list(numbering) + list(unmatched):
+        if lo != hi:
+            adj[lo].add(hi)
+            adj[hi].add(lo)
+    events = []
+    for img in area['images']:
+        for mk in sorted(img.get('marks', []), key=lambda m: m['y']):
+            n = owner(img['titles'], mk['y'])
+            if n is not None:
+                events.append((mk['kind'], n))
+    starts = [n for k, n in events if k == 'start']
+    ends = [n for k, n in events if k in ('next', 'exit')]
+    segs = [(starts[0], ends[-1])] if starts and ends and starts[0] != ends[-1] else []
+    paths, directed = [], set()
+    for a, b in segs:
+        prev = {a: None}
+        queue = collections.deque([a])
+        while queue and b not in prev:
+            u = queue.popleft()
+            for v in sorted(adj[u]):
+                if v not in prev:
+                    prev[v] = u
+                    queue.append(v)
+        if b not in prev:
+            continue
+        path = [b]
+        while prev[path[-1]] is not None:
+            path.append(prev[path[-1]])
+        path.reverse()
+        paths.append(path)
+        directed.update(zip(path, path[1:]))
+    return paths, directed
+
+
+def diagram(aid, numbering, unmatched, paths, directed):
     """マップ間の接続図(SVG)。BFS の層を左→右に並べ、線の中央に通し番号を置く。"""
     edges = [(lo, hi, no, False) for (lo, hi, _), no in numbering.items() if lo != hi]
     edges += [(lo, hi, None, True) for lo, hi, _ in unmatched if lo != hi]
@@ -75,24 +112,29 @@ def diagram(numbering, unmatched):
     cols = collections.defaultdict(list)
     for n in nodes:
         cols[layer[n]].append(n)
-    bw, bh, gx, gy = 64, 28, 56, 20
+    bw, bh, gx, gy = 64, 28, 56, 26
     pos = {}
     for c, members in cols.items():
         for r, n in enumerate(members):
             pos[n] = (12 + c * (bw + gx), 12 + r * (bh + gy))
     width = 24 + (max(cols) + 1) * (bw + gx) - gx
     height = 24 + max(len(m) for m in cols.values()) * (bh + gy) - gy
-    parts = [f'<svg class="graph" viewBox="0 0 {width} {height}" role="img" aria-label="マップ間の接続図">']
+    on_nodes = {n for p in paths for n in p}
+    starts, nexts = {p[0] for p in paths}, {p[-1] for p in paths}
+    on_edges = {frozenset(e) for e in directed}
+    parts = [f'<svg id="{aid}-graph" class="graph" viewBox="0 0 {width} {height}" role="img" aria-label="マップ間の接続図">']
     for lo, hi, no, warn in edges:
         (x1, y1), (x2, y2) = pos[lo], pos[hi]
         ax, ay, bx, by = x1 + bw / 2, y1 + bh / 2, x2 + bw / 2, y2 + bh / 2
-        parts.append(f'<line x1="{ax}" y1="{ay}" x2="{bx}" y2="{by}" class="edge{" warn" if warn else ""}"/>')
+        parts.append(f'<line x1="{ax}" y1="{ay}" x2="{bx}" y2="{by}" class="edge{" warn" if warn else ""}{" on" if frozenset((lo, hi)) in on_edges else ""}"/>')
     for lo, hi, no, warn in edges:
         (x1, y1), (x2, y2) = pos[lo], pos[hi]
         mx, my = (x1 + x2) / 2 + bw / 2, (y1 + y2) / 2 + bh / 2
         parts.append(f'<g class="el{" warn" if warn else ""}"><rect x="{mx - 9}" y="{my - 8}" width="18" height="16" rx="8"/><text x="{mx}" y="{my + 4}">{no if no else "?"}</text></g>')
     for n, (x, y) in pos.items():
-        parts.append(f'<g class="node"><rect x="{x}" y="{y}" width="{bw}" height="{bh}" rx="4"/><text x="{x + bw / 2}" y="{y + 18}">マップ{n}</text></g>')
+        tag = ('S' if n in starts else '') + ('次' if n in nexts else '')
+        tag_svg = f'<text class="tag" x="{x + 2}" y="{y - 3}" style="text-anchor:start">{"▶スタート" if n in starts else ""}{" 次のチャートへ" if n in nexts else ""}</text>' if tag else ''
+        parts.append(f'<a href="#{aid}-m{n}"><g class="node{" on" if n in on_nodes else ""}"><rect x="{x}" y="{y}" width="{bw}" height="{bh}" rx="4"/><text x="{x + bw / 2}" y="{y + 18}">マップ{n}</text></g>{tag_svg}</a>')
     parts.append('</svg>')
     return ''.join(parts)
 
@@ -102,12 +144,22 @@ def render(data):
     out = []
     for area in data['areas']:
         numbering, unmatched, ends = build_area(area)
-        out.append(f'<section id="{area["id"]}"><h2>{html.escape(area["name"])}</h2>')
-        out.append(diagram(numbering, unmatched))
+        aid = area['id']
+        paths, directed = find_route(area, numbering, unmatched)
+        out.append(f'<section id="{aid}"><h2>{html.escape(area["name"])}</h2>')
+        out.append(diagram(aid, numbering, unmatched, paths, directed))
+        for p in paths:
+            steps = ' → '.join(f'<a href="#{aid}-m{n}">マップ{n}</a>' for n in p)
+            out.append(f'<p class="route"><b>順路（推定）</b> スタート → {steps} → 出口</p>')
+        seen = set()
         for img in area['images']:
             w, h = img['w'], img['h']
-            out.append(f'<figure><figcaption>{html.escape(img["alt"])}</figcaption>')
+            out.append(f'<figure><figcaption>{html.escape(img["alt"])} <a href="#{aid}-graph">↑接続図</a></figcaption>')
             out.append(f'<div class="map" style="max-width:{w}px"><img src="{base}{img["file"]}" width="{w}" height="{h}" loading="lazy" alt="{html.escape(img["alt"])}">')
+            for t in img['titles']:
+                if t['n'] not in seen:
+                    seen.add(t['n'])
+                    out.append(f'<span class="anchor" id="{aid}-m{t["n"]}" style="top:{t["y"] / h * 100:.2f}%"></span>')
             for lab in img['labels']:
                 if '_owner' not in lab:
                     continue
@@ -115,9 +167,14 @@ def render(data):
                 cx, cy = (x0 + x1) / 2 / w * 100, (y0 + y1) / 2 / h * 100
                 no = lab['_no']
                 head = f'#{no}' if no else '？'
-                cls = 'badge' if no else 'badge warn'
-                tip = f'旧表記 {lab["text"]}（マップ{lab["_owner"]} → マップ{lab["_dest"]}）'
-                out.append(f'<span class="{cls}" style="left:{cx:.2f}%;top:{cy:.2f}%" title="{tip}"><b>{head}</b><i>→{lab["_dest"]}</i></span>')
+                u, v = lab['_owner'], lab['_dest']
+                cls, arrow = ('badge' if no else 'badge warn'), '→'
+                if (u, v) in directed:
+                    cls, arrow = cls + ' go', '▶'
+                elif (v, u) in directed:
+                    cls, arrow = cls + ' back', '←'
+                tip = f'旧表記 {lab["text"]}（マップ{u} → マップ{v}）'
+                out.append(f'<span class="{cls}" style="left:{cx:.2f}%;top:{cy:.2f}%" title="{tip}"><b>{head}</b><i>{arrow}マップ{v}</i></span>')
             out.append('</div></figure>')
         rows = []
         for key, no in sorted(numbering.items(), key=lambda t: t[1]):
@@ -137,16 +194,25 @@ PAGE = '''<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page} 接続マップ</title>
 <style>
-:root{{--bg:#fff;--fg:#222;--sub:#666;--line:#ddd;--badge:#c2185b;--warn:#e65100}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e8e8e8;--sub:#a0a0a0;--line:#3a3d45;--badge:#f06292;--warn:#ffb74d}}}}
+:root{{--bg:#fff;--fg:#222;--sub:#666;--line:#ddd;--badge:#c2185b;--warn:#e65100;--go:#1b8a3a}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e8e8e8;--sub:#a0a0a0;--line:#3a3d45;--badge:#f06292;--warn:#ffb74d;--go:#66bb6a}}}}
 body{{margin:0 auto;padding:16px;max-width:760px;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,sans-serif}}
-h1{{font-size:20px}} h2{{font-size:18px;border-bottom:2px solid var(--line);padding-bottom:4px;margin-top:40px}}
+a{{color:var(--badge)}} h1{{font-size:20px}} h2{{font-size:18px;border-bottom:2px solid var(--line);padding-bottom:4px;margin-top:40px}}
 .note{{background:rgba(128,128,128,.12);padding:10px 14px;border-radius:6px;font-size:14px}}
 figure{{margin:16px 0}} figcaption{{color:var(--sub);font-size:13px}}
 .map{{position:relative;line-height:0}} .map img{{width:100%;height:auto;display:block}}
 .badge{{position:absolute;transform:translate(-50%,-50%);background:var(--badge);color:#fff;border-radius:11px;padding:1px 6px;line-height:1.3;font-size:12px;white-space:nowrap;box-shadow:0 0 0 2px #fff;cursor:help}}
 .badge b{{font-size:14px}} .badge i{{font-style:normal;margin-left:3px;font-size:11px}}
 .badge.warn{{background:var(--warn)}}
+.badge.go{{background:var(--go);font-size:13px;padding:2px 9px;box-shadow:0 0 0 3px #fff,0 0 0 5px var(--go);z-index:2}}
+.badge.back{{background:#9e9e9e;font-size:11px}}
+.anchor{{position:absolute;left:0;width:100%;height:24px;margin-top:-3px;scroll-margin-top:12px;pointer-events:none}}
+.anchor:target{{background:rgba(255,193,7,.38);outline:2px solid #ffc107}}
+.route{{font-size:14px}} .route b{{color:var(--go)}}
+figcaption a{{font-size:12px;margin-left:6px}}
+.graph a{{cursor:pointer}} .graph a:hover .node rect{{stroke:var(--badge);stroke-width:2.5}}
+.graph .edge.on{{stroke:var(--go);stroke-width:4}} .graph .node.on rect{{fill:var(--go)}} .graph .node.on text{{fill:#fff;font-weight:700}}
+.graph .tag{{fill:var(--go);font-size:10px;font-weight:700}}
 table{{border-collapse:collapse;width:100%;font-size:13px;margin-top:12px}} th,td{{border:1px solid var(--line);padding:4px 8px;text-align:left}}
 tr.warn{{color:var(--warn)}}
 .graph{{width:100%;max-width:640px;height:auto;margin:8px 0}}
@@ -156,7 +222,7 @@ tr.warn{{color:var(--warn)}}
 .no{{display:inline-block;min-width:1.6em;text-align:center;background:var(--badge);color:#fff;border-radius:1em;padding:0 4px;font-weight:700}}
 </style></head><body>
 <h1>{page} 接続マップ（通し番号版）</h1>
-<p class="note">同じ番号の出入口どうしがつながっています。「→N」は行き先のマップ番号です。バッジにカーソルを重ねると元画像の表記（例: 2-1）が出ます。画像・内容は <a href="{source}">元ページ</a> のもので、個人利用の閲覧補助です。</p>
+<p class="note">同じ番号の出入口どうしがつながっています。<b>緑の「▶マップN」</b>が進む出口（スタート地点から最後の出口までの最短順路を機械的に推定したもの。違う場合は元ページを優先してください）、薄い「←」は戻る入口です。接続図のマップをクリックすると該当画像へ移動します。バッジにカーソルを重ねると元画像の表記（例: 2-1）が出ます。画像・内容は <a href="{source}">元ページ</a> のもので、個人利用の閲覧補助です。</p>
 {body}
 </body></html>
 '''
